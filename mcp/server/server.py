@@ -267,6 +267,7 @@ class RAGFlowConnector:
             "question": question,
             "dataset_ids": dataset_ids,
             "document_ids": document_ids,
+            "caller_type": "mcp",
         }
         # Send a POST request to the backend service (using requests library as an example, actual implementation may vary)
         res = await self._post("/retrieval", json=data_json, api_key=api_key)
