@@ -34,6 +34,7 @@ from api.db.services.doc_metadata_service import DocMetadataService
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.langfuse_service import TenantLangfuseService
 from api.db.services.llm_service import LLMBundle
+from api.db.services.retrieval_event_service import RetrievalEventService
 from common.metadata_utils import apply_meta_data_filter
 from api.utils.reference_metadata_utils import (
     enrich_chunks_with_document_metadata,
@@ -545,6 +546,25 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
     logging.debug("Begin async_chat")
     assert messages[-1]["role"] == "user", "The last content of this conversation is not from user."
     session_id = kwargs.get("session_id")
+
+    def record_retrieval(status, started_at, result=None, error_message=None):
+        try:
+            chunks = result.get("chunks", []) if isinstance(result, dict) else []
+            similarities = [chunk.get("similarity") for chunk in chunks if isinstance(chunk, dict) and isinstance(chunk.get("similarity"), (int, float))]
+            RetrievalEventService.record(
+                tenant_id=dialog.tenant_id,
+                caller_type="chat",
+                caller_id=str(kwargs.get("user_id") or session_id or "")[:255] or None,
+                dataset_ids=dialog.kb_ids,
+                document_count=0,
+                status=status,
+                latency=timer() - started_at,
+                result_count=len(chunks),
+                top_similarity=max(similarities) if similarities else None,
+                error_message=str(error_message)[:65535] if error_message else None,
+            )
+        except Exception:
+            logger.exception("Failed to record chat retrieval event")
     use_web_search = _should_use_web_search(dialog.prompt_config, kwargs.get("internet"))
     logging.debug("web_search kb=%s tavily=%s internet=%r enabled=%s", bool(dialog.kb_ids), bool(dialog.prompt_config.get("tavily_api_key")), kwargs.get("internet"), use_web_search)
     if not dialog.kb_ids and not use_web_search:
@@ -714,21 +734,27 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
 
         else:
             if embd_mdl:
-                kbinfos = await retriever.retrieval(
-                    " ".join(questions),
-                    embd_mdl,
-                    tenant_ids,
-                    dialog.kb_ids,
-                    1,
-                    dialog.top_n,
-                    dialog.similarity_threshold,
-                    dialog.vector_similarity_weight,
-                    doc_ids=attachments,
-                    top=dialog.top_k,
-                    aggs=True,
-                    rerank_mdl=rerank_mdl,
-                    rank_feature=label_question(" ".join(questions), kbs),
-                )
+                retrieval_started_at = timer()
+                try:
+                    kbinfos = await retriever.retrieval(
+                        " ".join(questions),
+                        embd_mdl,
+                        tenant_ids,
+                        dialog.kb_ids,
+                        1,
+                        dialog.top_n,
+                        dialog.similarity_threshold,
+                        dialog.vector_similarity_weight,
+                        doc_ids=attachments,
+                        top=dialog.top_k,
+                        aggs=True,
+                        rerank_mdl=rerank_mdl,
+                        rank_feature=label_question(" ".join(questions), kbs),
+                    )
+                except Exception as e:
+                    record_retrieval("error", retrieval_started_at, error_message=e)
+                    raise
+                record_retrieval("success", retrieval_started_at, kbinfos)
                 if prompt_config.get("toc_enhance"):
                     cks = await retriever.retrieval_by_toc(" ".join(questions), kbinfos["chunks"], tenant_ids, chat_mdl, dialog.top_n)
                     if cks:

@@ -16,6 +16,7 @@
 from datetime import datetime, timedelta
 from quart import request
 from api.db.services.api_service import API4ConversationService
+from api.db.services.retrieval_event_service import RetrievalEventService
 from api.db.services.user_service import UserTenantService
 from api.utils.api_utils import get_data_error_result, get_json_result, server_error_response
 from api.apps import login_required, current_user
@@ -51,5 +52,23 @@ def stats():
             res["thumb_up"].append((dt, obj["thumb_up"]))
 
         return get_json_result(data=res)
+    except Exception as e:
+        return server_error_response(e)
+
+
+@manager.route('/system/retrieval-stats', methods=['GET'])  # noqa: F821
+@login_required
+def retrieval_stats():
+    try:
+        tenants = UserTenantService.query(user_id=current_user.id)
+        if not tenants:
+            return get_data_error_result(message="Tenant not found!")
+        from_date = request.args.get("from_date", (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d 00:00:00"))
+        to_date = request.args.get("to_date", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if len(from_date) == 10:
+            from_date += " 00:00:00"
+        if len(to_date) == 10:
+            to_date += " 23:59:59"
+        return get_json_result(data=RetrievalEventService.stats(tenants[0].tenant_id, from_date, to_date))
     except Exception as e:
         return server_error_response(e)

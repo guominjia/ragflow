@@ -1087,6 +1087,23 @@ class API4Conversation(DataBaseModel):
         db_table = "api_4_conversation"
 
 
+class RetrievalEvent(DataBaseModel):
+    id = CharField(max_length=32, primary_key=True)
+    tenant_id = CharField(max_length=32, null=False, index=True)
+    caller_type = CharField(max_length=32, null=False, default="direct_api", index=True)
+    caller_id = CharField(max_length=255, null=True, index=True)
+    dataset_ids = JSONField(null=False, default=[])
+    document_count = IntegerField(default=0)
+    status = CharField(max_length=16, null=False, index=True)
+    latency = FloatField(default=0, index=True)
+    result_count = IntegerField(default=0)
+    top_similarity = FloatField(null=True)
+    error_message = TextField(null=True)
+
+    class Meta:
+        db_table = "retrieval_event"
+
+
 class UserCanvas(DataBaseModel):
     id = CharField(max_length=32, primary_key=True)
     avatar = TextField(null=True, help_text="avatar base64 string")

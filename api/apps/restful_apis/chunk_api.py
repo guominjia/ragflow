@@ -18,12 +18,13 @@ import binascii
 import datetime
 import logging
 import re
+import time
 
 import xxhash
 from pydantic import BaseModel, Field, validator
 from quart import request
 
-from api.apps import login_required
+from api.apps import current_user, login_required
 from api.db.joint_services.tenant_model_service import (
     split_model_name,
     get_model_config_from_provider_instance,
@@ -35,6 +36,7 @@ from api.db.services.document_service import DocumentService
 from api.db.services.file2document_service import File2DocumentService
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.llm_service import LLMBundle
+from api.db.services.retrieval_event_service import RetrievalEventService
 from api.db.services.task_service import TaskService, cancel_all_task_of, queue_tasks
 from api.db.services.tenant_llm_service import TenantLLMService
 from api.utils.api_utils import (
@@ -281,36 +283,67 @@ async def stop_parsing(tenant_id, dataset_id):
 @login_required
 @add_tenant_id_to_kwargs
 async def retrieval_test(tenant_id):
+    started_at = time.perf_counter()
     req = await get_request_json()
+    caller_type = req.get("caller_type", "direct_api")
+    caller_type = caller_type if isinstance(caller_type, str) and caller_type else "direct_api"
+    caller_type = caller_type[:32]
+    caller_id = str(getattr(current_user, "id", ""))[:255] or None
+
+    def record_event(status, dataset_ids, document_count=0, result_count=0, top_similarity=None, error_message=None):
+        try:
+            RetrievalEventService.record(
+                tenant_id=tenant_id,
+                caller_type=caller_type,
+                caller_id=caller_id,
+                dataset_ids=dataset_ids,
+                document_count=document_count,
+                status=status,
+                latency=time.perf_counter() - started_at,
+                result_count=result_count,
+                top_similarity=top_similarity,
+                error_message=error_message[:65535] if error_message else None,
+            )
+        except Exception:
+            logging.exception("Failed to record retrieval event")
+
     if not req.get("dataset_ids"):
+        record_event("invalid_request", [], error_message="`dataset_ids` is required.")
         return get_error_data_result("`dataset_ids` is required.")
     kb_ids = req["dataset_ids"]
     if not isinstance(kb_ids, list):
+        record_event("invalid_request", [], error_message="`dataset_ids` should be a list")
         return get_error_data_result("`dataset_ids` should be a list")
     for id in kb_ids:
         if not KnowledgebaseService.accessible(kb_id=id, user_id=tenant_id):
+            record_event("invalid_request", kb_ids, error_message=f"Unauthorized dataset: {id}")
             return get_error_data_result(f"You don't own the dataset {id}.")
     kbs = KnowledgebaseService.get_by_ids(kb_ids)
     embd_nms = list(set([split_model_name(kb.embd_id)[0] for kb in kbs]))
     if len(embd_nms) != 1:
+        record_event("invalid_request", kb_ids, error_message="Datasets use different embedding models.")
         return get_result(message="Datasets use different embedding models.", code=RetCode.DATA_ERROR)
     if "question" not in req:
+        record_event("invalid_request", kb_ids, error_message="`question` is required.")
         return get_error_data_result("`question` is required.")
     page = int(req.get("page", 1))
     size = validate_rest_api_page_size(int(req.get("page_size", 30)))
     question = req["question"].strip() if isinstance(req["question"], str) else req["question"]
     if not question:
+        record_event("success", kb_ids)
         return get_result(data={"total": 0, "chunks": [], "doc_aggs": {}})
     doc_ids = req.get("document_ids", [])
     use_kg = req.get("use_kg", False)
     toc_enhance = req.get("toc_enhance", False)
     langs = req.get("cross_languages", [])
     if not isinstance(doc_ids, list):
+        record_event("invalid_request", kb_ids, error_message="`documents` should be a list")
         return get_error_data_result("`documents` should be a list")
     if doc_ids:
         doc_ids_list = KnowledgebaseService.list_documents_by_ids(kb_ids)
         for doc_id in doc_ids:
             if doc_id not in doc_ids_list:
+                record_event("invalid_request", kb_ids, document_count=len(doc_ids), error_message=f"Unauthorized document: {doc_id}")
                 return get_error_data_result(f"The datasets don't own the document {doc_id}")
     if not doc_ids:
         metadata_condition = req.get("metadata_condition")
@@ -318,6 +351,7 @@ async def retrieval_test(tenant_id):
             metas = DocMetadataService.get_flatted_meta_by_kbs(kb_ids)
             doc_ids = meta_filter(metas, convert_conditions(metadata_condition), metadata_condition.get("logic", "and"))
             if not doc_ids and metadata_condition.get("conditions"):
+                record_event("success", kb_ids)
                 return get_result(data={"total": 0, "chunks": [], "doc_aggs": {}})
             if metadata_condition and not doc_ids:
                 doc_ids = ["-999"]
@@ -327,6 +361,7 @@ async def retrieval_test(tenant_id):
     vector_similarity_weight = float(req.get("vector_similarity_weight", 0.3))
     top = int(req.get("top_k", 1024))
     if top <= 0:
+        record_event("invalid_request", kb_ids, document_count=len(doc_ids or []), error_message="`top_k` must be greater than 0")
         return get_error_data_result("`top_k` must be greater than 0")
     highlight_val = req.get("highlight", None)
     if highlight_val is None:
@@ -336,6 +371,7 @@ async def retrieval_test(tenant_id):
     elif isinstance(highlight_val, str) and highlight_val.lower() in ["true", "false"]:
         highlight = highlight_val.lower() == "true"
     else:
+        record_event("invalid_request", kb_ids, document_count=len(doc_ids or []), error_message="`highlight` should be a boolean")
         return get_error_data_result("`highlight` should be a boolean")
     include_metadata, metadata_fields = _resolve_reference_metadata(req)
     try:
@@ -390,8 +426,17 @@ async def retrieval_test(tenant_id):
             "kb_id": "dataset_id",
         }
         ranks["chunks"] = [{key_mapping.get(key, key): value for key, value in chunk.items()} for chunk in ranks["chunks"]]
+        similarities = [chunk.get("similarity") for chunk in ranks["chunks"] if isinstance(chunk.get("similarity"), (int, float))]
+        record_event(
+            "success",
+            kb_ids,
+            document_count=len(doc_ids or []),
+            result_count=len(ranks["chunks"]),
+            top_similarity=max(similarities) if similarities else None,
+        )
         return get_result(data=ranks)
     except Exception as e:
+        record_event("error", kb_ids, document_count=len(doc_ids or []), error_message=str(e))
         if "not_found" in str(e):
             return get_result(message="No chunk found! Check the chunk status please!", code=RetCode.DATA_ERROR)
         return server_error_response(e)
