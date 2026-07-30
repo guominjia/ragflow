@@ -66,6 +66,8 @@ def _es_response_total(response: Any) -> Optional[int]:
 class DocMetadataService:
     """Service for managing document metadata in ES/Infinity"""
 
+    _METADATA_FACET_SIZE = 1000
+
     @staticmethod
     def _get_doc_meta_index_name(tenant_id: str) -> str:
         """
@@ -1074,6 +1076,92 @@ class DocMetadataService:
         except Exception as e:
             logging.error(f"Error getting metadata for documents: {e}")
             return {}
+
+    @classmethod
+    def get_metadata_filter_counts(cls, kb_id: str) -> Optional[tuple[Dict[str, Dict[str, int]], int]]:
+        """Return metadata facet counts for one KB using Elasticsearch aggregations.
+
+        ``None`` means the native aggregation path is unavailable or cannot
+        return complete buckets, so callers can use their existing fallback.
+        The second result is the number of documents with at least one mapped
+        metadata field.
+        """
+        if settings.DOC_ENGINE_INFINITY or settings.DOC_ENGINE_OCEANBASE:
+            return None
+
+        try:
+            kb = Knowledgebase.get_by_id(kb_id)
+            if not kb:
+                return None
+
+            index_name = cls._get_doc_meta_index_name(kb.tenant_id)
+            es_client = getattr(settings.docStoreConn, "es", None)
+            if es_client is None or not settings.docStoreConn.index_exist(index_name, ""):
+                return None
+
+            mappings = es_client.indices.get_mapping(index=index_name)
+            mapping = next(iter(dict(mappings).values()), {}).get("mappings", {})
+            meta_properties = mapping.get("properties", {}).get("meta_fields", {}).get("properties", {})
+
+            facet_fields = []
+            for key, field_mapping in meta_properties.items():
+                if "keyword" in field_mapping.get("fields", {}):
+                    facet_fields.append((key, f"meta_fields.{key}.keyword"))
+                elif field_mapping.get("type") == "keyword":
+                    facet_fields.append((key, f"meta_fields.{key}"))
+
+            if not facet_fields:
+                return {}, 0
+
+            aggregations = {
+                f"metadata_{index}": {
+                    "terms": {"field": field, "size": cls._METADATA_FACET_SIZE}
+                }
+                for index, (_, field) in enumerate(facet_fields)
+            }
+            aggregations["documents_with_metadata"] = {
+                "filter": {
+                    "bool": {
+                        "should": [{"exists": {"field": field}} for _, field in facet_fields],
+                        "minimum_should_match": 1,
+                    }
+                }
+            }
+            response = es_client.search(
+                index=index_name,
+                body={
+                    "size": 0,
+                    "track_total_hits": False,
+                    "query": {"term": {"kb_id": kb_id}},
+                    "aggs": aggregations,
+                },
+            )
+            response = dict(response)
+            response_aggs = response.get("aggregations", {})
+            metadata_counter = {}
+            for index, (key, _) in enumerate(facet_fields):
+                facet = response_aggs.get(f"metadata_{index}", {})
+                if facet.get("sum_other_doc_count", 0) > 0:
+                    logging.info(
+                        "Metadata facet exceeds %d values for kb_id=%s, falling back to full aggregation",
+                        cls._METADATA_FACET_SIZE,
+                        kb_id,
+                    )
+                    return None
+
+                values = {}
+                for bucket in facet.get("buckets", []):
+                    value = str(bucket.get("key", ""))
+                    if value.strip():
+                        values[value] = bucket.get("doc_count", 0)
+                if values:
+                    metadata_counter[key] = values
+
+            documents_with_metadata = response_aggs.get("documents_with_metadata", {}).get("doc_count", 0)
+            return metadata_counter, documents_with_metadata
+        except Exception:
+            logging.warning("ES metadata facet aggregation failed for kb_id=%s", kb_id, exc_info=True)
+            return None
 
     @classmethod
     @DB.connection_context()

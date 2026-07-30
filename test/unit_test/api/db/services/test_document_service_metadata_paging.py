@@ -68,6 +68,15 @@ class _FakeQuery:
     def count(self):
         return len(self._all)
 
+    def select(self, *args, **kwargs):
+        return self
+
+    def group_by(self, *args, **kwargs):
+        return self
+
+    def __iter__(self):
+        return iter(self._current)
+
     def paginate(self, page, page_size):
         if page and page_size:
             start = (page - 1) * page_size
@@ -192,3 +201,46 @@ def test_get_by_kb_id_return_empty_metadata_keeps_dataset_wide_lookup(metadata_c
     assert count == 3
     assert docs[0]["meta_fields"] == {}
     assert metadata_calls == [(None, "kb-1")]
+
+
+@pytest.mark.p2
+def test_get_filter_by_kb_id_uses_metadata_facets_without_full_metadata_lookup(metadata_calls, monkeypatch):
+    grouped_rows = [
+        SimpleNamespace(run=1, suffix="pdf", count=2),
+        SimpleNamespace(run=2, suffix="docx", count=1),
+    ]
+
+    class _FilterQuery(_FakeQuery):
+        def select(self, *args, **kwargs):
+            self._current = grouped_rows if args else self._all
+            return self
+
+    model = SimpleNamespace(
+        select=lambda *args, **kwargs: _FilterQuery([{"id": "doc-1"}, {"id": "doc-2"}, {"id": "doc-3"}]),
+        id=_FakeField(),
+        kb_id=_FakeField(),
+        name=_FakeField(),
+        suffix=_FakeField(),
+        run=_FakeField(),
+        type=_FakeField(),
+    )
+    monkeypatch.setattr(document_service.DocumentService, "model", model)
+    monkeypatch.setattr(document_service.DocumentService, "get_cls_model_fields", classmethod(lambda cls: []))
+    monkeypatch.setattr(
+        document_service.DocMetadataService,
+        "get_metadata_filter_counts",
+        classmethod(lambda cls, kb_id: ({"space": {"Platform": 2}}, 2)),
+    )
+
+    payload, total = document_service.DocumentService.get_filter_by_kb_id(
+        "kb-1", "", [], [], []
+    )
+
+    assert total == 3
+    assert payload["suffix"] == {"pdf": 2, "docx": 1}
+    assert payload["run_status"] == {"1": 2, "2": 1}
+    assert payload["metadata"] == {
+        "space": {"Platform": 2},
+        "empty_metadata": {"true": 0},
+    }
+    assert metadata_calls == []
